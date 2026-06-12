@@ -1,0 +1,13 @@
+# projects.yaml — GPU Fleet Monitor project list
+# Copy to projects.yaml and fill in your GCP project IDs.
+
+projects:
+  - key: gb200
+    display_name: "GB200 Fleet"
+    project_id: "your-gcp-project-id-1"
+    machine_type_prefix: "a4-"         # filter hint only
+
+  - key: b200
+    display_name: "B200 Fleet"
+    project_id: "your-gcp-project-id-2"
+    machine_type_prefix: "a3-"

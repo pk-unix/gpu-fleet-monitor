@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+venv/
+fleet.db
+projects.yaml
+logs/
+*.log
