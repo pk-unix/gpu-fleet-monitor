@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>gpu-fleet-monitor</title>
+<style>
+:root{--bg:#0b0f14;--panel:#12171f;--panel2:#171d27;--border:#242c38;
+--text:#e6e9ee;--muted:#9aa4b2;--accent:#76b900;--accent2:#9fe870;--code-bg:#0d1219}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;line-height:1.65}
+.wrap{max-width:980px;margin:0 auto;padding:0 24px}
+header.top{position:sticky;top:0;z-index:10;background:var(--panel);border-bottom:1px solid var(--border);padding:14px 0}
+header.top .wrap{display:flex;align-items:center;justify-content:space-between}
+header.top a{color:var(--text);text-decoration:none;font-weight:700}
+.badge{background:var(--accent);color:#08130a;font-size:11px;font-weight:700;padding:3px 8px;border-radius:20px;margin-left:10px}
+.hero{padding:48px 0 16px}
+.hero h1{font-size:2.2rem;margin:.2em 0}
+.hero p{color:var(--muted);font-size:1.1rem;max-width:760px}
+.clone-box{background:var(--code-bg);border:1px solid var(--border);border-radius:8px;padding:14px 18px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:14px;overflow-x:auto;margin:18px 0}
+h2{color:var(--accent2);border-bottom:1px solid var(--border);padding-bottom:8px;margin-top:44px}
+h3{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--text);font-size:1.05rem;margin-top:28px}
+h3 .purpose{color:var(--muted);font-family:-apple-system,sans-serif;font-weight:400;font-size:.9rem;display:block;margin-top:4px}
+pre{background:var(--code-bg);border:1px solid var(--border);border-radius:8px;padding:16px;overflow-x:auto;font-size:13px}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+table{width:100%;border-collapse:collapse;margin:16px 0}
+th,td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--border);font-size:14px}
+th{color:var(--muted);font-weight:600}
+a{color:var(--accent2)}
+footer{border-top:1px solid var(--border);margin-top:60px;padding:28px 0;color:var(--muted);font-size:13px}
+.note{background:var(--panel2);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:6px;padding:12px 16px;margin:18px 0;font-size:14px;color:var(--muted)}
+</style>
+</head>
+<body>
+<header class="top"><div class="wrap"><a href="#top">gpu-fleet-monitor</a><span class="badge">pk-unix</span></div></header>
+<div class="wrap">
+<div class="hero" id="top">
+<h1>gpu-fleet-monitor</h1>
+<p>| Frontend | Vanilla HTML/CSS |</p>
+</div>
+
+<div class="clone-box">git clone https://github.com/pk-unix/gpu-fleet-monitor.git<br>cd gpu-fleet-monitor</div>
+<h2>Source</h2>
+<h3>app.py</h3>
+<pre><code class="language-python">#!/usr/bin/env python3
+"""
+app.py — GPU Fleet Monitor  (port 8484 by default).
+
+Tracks GCP GPU instance state (GB200 / B200 / H100 etc.) and surfaces
+Cloud Logging events (XID errors, host-level faults, interruptions,
+syslog entries) per node — with copyable gcloud commands.
+
+Requires: gcloud CLI authenticated, projects listed in projects.yaml.
+"""
+from __future__ import annotations
+
+import datetime
+import subprocess
+import threading
+from pathlib import Path
+
+import yaml
+from flask import Flask, jsonify, redirect, render_template, request, url_for
+
+import db
+import gcp_logs
+
+ROOT = Path(__file__).parent
+GCLOUD = "gcloud"
+PORT = int(__import__("os").environ.get("PORT", 8484))
+
+app = Flask(__name__, template_folder=str(ROOT / "templates"),
+            static_folder=str(ROOT / "static"))
+app.config["TEMPLATES_AUTO_RELOAD"] = True
+
+db.init()
+
+
+def load_projects() -&gt; list[dict]:
+    with open(ROOT / "projects.yaml") as f:
+        return yaml.safe_load(f)["projects"]
+
+
+def project_index() -&gt; dict[str, dict]:
+    return {p["key"]: p for p in load_projects()}
+
+
+# ── background refresh ────────────────────────────────────────────────────────
+
+_refresh = {"running": False, "done": 0, "total": 0, "started": "", "finished": ""}
+_lock = threading.Lock()
+
+
+def _run_refresh(keys: list[str]) -&gt; None:
+    import collect
+    with _lock:
+        _refresh.update(running=True, done=0, total=len(keys),
+                        started=datetime.datetime.now().strftime("%H:%M:%S"),
+                        finished="")
+    idx = project_index()
+    for k in keys:
+        try:
+            collect.collect_one(idx[k])
+        except Exception:
+            pass
+        with _lock:
+            _refresh["done"] += 1
+    with _lock:
+        _refresh.update(running=False,
+                        finished=datetime.datetime.now().strftime("%H:%M:%S"))
+
+
+# ── template helpers ──────────────────────────────────────────────────────────
+
+@app.template_filter("ago")
+def ago(ts: str | None) -&gt; str:
+    if not ts:
+        return "—"
+    try:
+        dt = datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S")
+        s = (datetime.datetime.utcnow() - dt).total_seconds()
+        if s &lt; 60:
+            return f"{int(s)}s ago"
+        if s &lt; 3600:
+            return f"{int(s/60)}m ago"
+        return f"{int(s/3600)}h ago"
+    except Exception:
+        return ts
+
+
+# ── routes ────────────────────────────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    projects = load_projects()
+    instances = {p["key"]: db.get_instances(p["key"]) for p in projects}
+    summary = {p["key"]: {
+        "total": len(instances[p["key"]]),
+        "running": sum(1 for i in instances[p["key"]] if i["status"] == "RUNNING"),
+        "stopped": sum(1 for i in instances[p["key"]] if i["status"] != "RUNNING"),
+    } for p in projects}
+    with _lock:
+        refresh_state = dict(_refresh)
+    return render_template("index.html", projects=projects, instances=instances,
+                           summary=summary, refresh=refresh_state)
+
+
+@app.route("/instance/&lt;project_key&gt;/&lt;name&gt;")
+def instance_detail(project_key: str, name: str):
+    instance = db.get_instance(project_key, name)
+    if not instance:
+        return redirect(url_for("index"))
+    logs = db.get_logs(project_key, name, limit=200)
+    proj = project_index().get(project_key, {})
+    gcloud_cmds = gcp_logs.build_gcloud_commands(proj.get("project_id", ""), name)
+    return render_template("instance.html", instance=instance, logs=logs,
+                           gcloud_cmds=gcloud_cmds, project_key=project_key)
+
+
+@app.route("/refresh", methods=["POST"])
+def refresh():
+    keys = request.form.getlist("keys") or [p["key"] for p in load_projects()]
+    threading.Thread(target=_run_refresh, args=(keys,), daemon=True).start()
+    return redirect(url_for("index"))
+
+
+@app.route("/api/refresh-status")
+def refresh_status():
+    with _lock:
+        return jsonify(dict(_refresh))
+
+
+@app.route("/healthz")
+def healthz():
+    return jsonify({"status": "ok"})
+
+
+if __name__ == "__main__":
+    print(f"GPU Fleet Monitor → http://localhost:{PORT}")
+    app.run(host="0.0.0.0", port=PORT, debug=False)
+</code></pre>
+<h3>collect.py</h3>
+<pre><code class="language-python">#!/usr/bin/env python3
+"""
+collect.py — Poll GCE GPU instances and discover Cloud Logging streams.
+
+Run by cron every 5 minutes (or via the app's Refresh button).
+
+Usage:
+    python collect.py                        # all projects in projects.yaml
+    python collect.py --project my-project   # one project by key
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+import yaml
+import db
+
+GCLOUD = "gcloud"
+ROOT = Path(__file__).parent
+RACK_RE = re.compile(r"(rack\d+)", re.IGNORECASE)
+
+
+def load_projects() -&gt; list[dict]:
+    with open(ROOT / "projects.yaml") as f:
+        return yaml.safe_load(f)["projects"]
+
+
+def _now() -&gt; str:
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def fetch_instances(project_id: str) -&gt; list[dict]:
+    fmt = "csv[no-heading](name,id,zone,machineType.basename(),status,lastStartTimestamp,statusMessage)"
+    out = subprocess.run(
+        [GCLOUD, "compute", "instances", "list",
+         f"--project={project_id}", f"--format={fmt}"],
+        capture_output=True, text=True, timeout=300,
+    )
+    if out.returncode != 0:
+        raise RuntimeError(out.stderr.strip()[:500])
+    rows = []
+    for line in out.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split(",", 6)
+        parts += [""] * (7 - len(parts))
+        name, iid, zone, mtype, status, last_start, msg = parts[:7]
+        m = RACK_RE.search(name)
+        rows.append({
+            "name": name, "instance_id": iid, "zone": zone,
+            "machine_type": mtype, "status": status,
+            "last_start": last_start, "status_message": msg,
+            "rack": m.group(1).lower() if m else "",
+        })
+    return rows
+
+
+def collect_one(proj: dict) -&gt; None:
+    key = proj["key"]
+    project_id = proj["project_id"]
+    print(f"  [{key}] collecting…", end=" ", flush=True)
+    try:
+        instances = fetch_instances(project_id)
+        db.save_instances(key, instances, _now())
+        print(f"{len(instances)} instances")
+    except Exception as e:
+        print(f"ERROR: {e}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--project", help="Collect a single project by key")
+    args = ap.parse_args()
+
+    db.init()
+    projects = load_projects()
+    if args.project:
+        projects = [p for p in projects if p["key"] == args.project]
+        if not projects:
+            print(f"No project with key: {args.project}")
+            sys.exit(1)
+
+    for proj in projects:
+        collect_one(proj)
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+<h3>db.py</h3>
+<pre><code class="language-python">#!/usr/bin/env python3
+"""db.py — SQLite cache for GPU Fleet Monitor."""
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+ROOT = Path(__file__).parent
+DB_PATH = ROOT / "fleet.db"
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS instances (
+  project_key   TEXT NOT NULL,
+  name          TEXT NOT NULL,
+  instance_id   TEXT,
+  zone          TEXT,
+  machine_type  TEXT,
+  status        TEXT,
+  last_start    TEXT,
+  status_message TEXT,
+  rack          TEXT,
+  collected_at  TEXT,
+  PRIMARY KEY (project_key, name)
+);
+CREATE INDEX IF NOT EXISTS idx_instances_project ON instances(project_key);
+
+CREATE TABLE IF NOT EXISTS log_events (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_key  TEXT,
+  instance     TEXT,
+  event_type   TEXT,
+  severity     TEXT,
+  message      TEXT,
+  timestamp    TEXT,
+  log_name     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_logs_instance ON log_events(project_key, instance);
+"""
+
+
+def _conn():
+    c = sqlite3.connect(DB_PATH)
+    c.row_factory = sqlite3.Row
+    return c
+
+
+def init():
+    with _conn() as c:
+        c.executescript(SCHEMA)
+
+
+def save_instances(project_key: str, instances: list[dict], collected_at: str):
+    with _conn() as c:
+        c.execute("DELETE FROM instances WHERE project_key=?", (project_key,))
+        for i in instances:
+            c.execute("""
+                INSERT OR REPLACE INTO instances
+                  (project_key,name,instance_id,zone,machine_type,status,
+                   last_start,status_message,rack,collected_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+            """, (project_key, i["name"], i.get("instance_id"), i.get("zone"),
+                  i.get("machine_type"), i.get("status"), i.get("last_start"),
+                  i.get("status_message"), i.get("rack"), collected_at))
+
+
+def get_instances(project_key: str) -&gt; list[dict]:
+    with _conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM instances WHERE project_key=? ORDER BY name",
+            (project_key,))]
+
+
+def get_instance(project_key: str, name: str) -&gt; dict | None:
+    with _conn() as c:
+        r = c.execute(
+            "SELECT * FROM instances WHERE project_key=? AND name=?",
+            (project_key, name)).fetchone()
+        return dict(r) if r else None
+
+
+def get_logs(project_key: str, instance: str, limit: int = 200) -&gt; list[dict]:
+    with _conn() as c:
+        return [dict(r) for r in c.execute(
+            """SELECT * FROM log_events WHERE project_key=? AND instance=?
+               ORDER BY timestamp DESC LIMIT ?""",
+            (project_key, instance, limit))]
+</code></pre>
+<h3>gcp_logs.py</h3>
+<pre><code class="language-python">#!/usr/bin/env python3
+"""gcp_logs.py — Cloud Logging helpers for GPU instances."""
+from __future__ import annotations
+
+import json
+import subprocess
+from typing import Optional
+
+
+LOG_FILTERS = {
+    "xid":  'jsonPayload.XID != "" OR textPayload =~ "XID"',
+    "host": 'logName =~ "hostError|system_event"',
+    "syslog": 'logName =~ "syslog" AND severity &gt;= WARNING',
+}
+
+
+def build_gcloud_commands(project_id: str, instance_name: str) -&gt; dict[str, str]:
+    """Return copy-pasteable gcloud logging commands for an instance."""
+    base = (f'gcloud logging read --project={project_id} '
+            f'--freshness=7d --format=json')
+    return {
+        "XID errors": (f'{base} \'resource.labels.instance_id="{instance_name}" '
+                       f'AND (jsonPayload.XID!="" OR textPayload=~"XID")\''),
+        "Host errors": (f'{base} \'resource.labels.instance_id="{instance_name}" '
+                        f'AND logName=~"hostError"\''),
+        "Syslog warnings": (f'{base} \'resource.labels.instance_id="{instance_name}" '
+                            f'AND logName=~"syslog" AND severity&gt;=WARNING\''),
+    }
+
+
+def fetch_logs(project_id: str, instance_name: str,
+               filter_key: str = "xid", limit: int = 50) -&gt; list[dict]:
+    log_filter = (f'resource.labels.instance_id="{instance_name}" '
+                  f'AND ({LOG_FILTERS.get(filter_key, "")})')
+    out = subprocess.run(
+        ["gcloud", "logging", "read", f"--project={project_id}",
+         "--freshness=7d", "--format=json", f"--limit={limit}", log_filter],
+        capture_output=True, text=True, timeout=120,
+    )
+    if out.returncode != 0 or not out.stdout.strip():
+        return []
+    try:
+        return json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return []
+</code></pre>
+<h3>projects.example.yaml</h3>
+<pre><code class="language-yaml"># projects.yaml — GPU Fleet Monitor project list
+# Copy to projects.yaml and fill in your GCP project IDs.
+
+projects:
+  - key: gb200
+    display_name: "GB200 Fleet"
+    project_id: "your-gcp-project-id-1"
+    machine_type_prefix: "a4-"         # filter hint only
+
+  - key: b200
+    display_name: "B200 Fleet"
+    project_id: "your-gcp-project-id-2"
+    machine_type_prefix: "a3-"
+</code></pre>
+<h2>Full README</h2>
+<pre><code># GPU Fleet Monitor
+
+A Flask dashboard for monitoring GCP GPU instance fleets (GB200, B200, H100, etc.) — tracks instance health, surfaces Cloud Logging events (XID errors, host faults, syslog warnings) per node, and provides copy-pasteable `gcloud` commands for deep investigation.
+
+![Python](https://img.shields.io/badge/python-3.10+-blue) ![GCP](https://img.shields.io/badge/cloud-GCP-4285F4) ![Flask](https://img.shields.io/badge/flask-3.0-green)
+
+---
+
+## What it does
+
+- **Fleet overview** — all GCP projects in one view, instance counts, running/stopped status
+- **Per-instance detail** — zone, machine type, status, last start time, rack grouping
+- **Cloud Logging integration** — XID GPU errors, host-level faults, syslog warnings surfaced in the UI
+- **Copyable gcloud commands** — one-click copy for `gcloud logging read` queries scoped to each instance
+- **Background refresh** — cron/launchd driven; manual refresh button in the UI
+- **Multi-project** — configure any number of GCP projects in `projects.yaml`
+
+## Architecture
+
+```
+projects.yaml         ← GCP project IDs + display config
+      │
+      ▼
+collect.py  (cron every 5 min)
+      │  gcloud compute instances list
+      ▼
+fleet.db    (SQLite)
+      │
+      ▼
+app.py  (Flask — port 8484)
+      │  on-demand: gcloud logging read (per instance)
+      ▼
+Browser dashboard
+```
+
+## Quick start
+
+```bash
+git clone https://github.com/pk-unix/gpu-fleet-monitor
+cd gpu-fleet-monitor
+
+# 1. Authenticate with GCP
+gcloud auth application-default login
+
+# 2. Configure your projects
+cp projects.example.yaml projects.yaml
+$EDITOR projects.yaml
+
+# 3. Install dependencies
+python3 -m venv venv &amp;&amp; venv/bin/pip install -r requirements.txt
+
+# 4. Initial collection
+venv/bin/python collect.py
+
+# 5. Start the dashboard
+venv/bin/python app.py
+# → http://localhost:8484
+```
+
+## Cron example
+
+```bash
+# Collect every 5 minutes
+*/5 * * * * /opt/gpu-monitor/venv/bin/python /opt/gpu-monitor/collect.py
+```
+
+## projects.yaml format
+
+```yaml
+projects:
+  - key: gb200-fleet
+    display_name: "GB200 Production Fleet"
+    project_id: "my-gcp-project-12345"
+    machine_type_prefix: "a4-"
+```
+
+## Requirements
+
+- Python 3.10+
+- `gcloud` CLI authenticated (`gcloud auth application-default login`)
+- GCP roles: `compute.viewer` + `logging.viewer` on each project
+
+## Stack
+
+| Layer | Tech |
+|---|---|
+| Backend | Python 3, Flask 3 |
+| Storage | SQLite |
+| Cloud | GCP Compute Engine API + Cloud Logging |
+| CLI | `gcloud` subprocess |
+| Frontend | Vanilla HTML/CSS |
+</code></pre>
+</div>
+<footer><div class="wrap">
+<a href="https://github.com/pk-unix/gpu-fleet-monitor">View on GitHub</a> · © 2026 Pravin Kumar. All rights reserved.
+</div></footer>
+<script>document.addEventListener('contextmenu', function(e){ e.preventDefault(); });</script>
+</body>
+</html>
